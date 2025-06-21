@@ -1,267 +1,229 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
+// === State machine states ===
+enum State {
+  STATE_IDLE,
+  STATE_VOTING,
+  STATE_CONFIRMATION,
+  STATE_VOTE_RECORDED,
+  STATE_RESULT_DISPLAY,
+  STATE_LOCKED
+};
 
-#define MAX_CANDIDATES 5
-#define MAX_VOTERS 100
-#define MAX_ID_LEN 50
-#define TIMEOUT_SECONDS 30
+State currentState = STATE_IDLE;
 
-typedef enum {
-    STATE_IDLE,
-    STATE_VOTING,
-    STATE_CONFIRMATION,
-    STATE_VOTE_RECORDED,
-    STATE_RESULT_DISPLAY,
-    STATE_LOCKED
-} State;
+// === Button pins ===
+const int candidate1Btn = 2;
+const int candidate2Btn = 3;
+const int candidate3Btn = 4;
+const int notaBtn       = 5;
+const int confirmBtn    = 6;
+const int resetBtn      = 7;
 
-typedef struct {
-    char name[50];
-    int votes;
-} Candidate;
+// === Output pins ===
+const int greenLED = 8;
+const int redLED   = 9;
+const int buzzerPin = 10;
 
-typedef struct {
-    char voter_id[MAX_ID_LEN];
-    int has_voted;
-    time_t vote_time;
-} Voter;
+// === Vote storage: [C1, C2, C3, NOTA] ===
+int votes[4] = {0, 0, 0, 0};
 
-Candidate candidates[MAX_CANDIDATES + 1]; // +1 for NOTA
-Voter voters[MAX_VOTERS];
-int num_candidates = 0, num_voters = 0;
-State current_state = STATE_IDLE;
-int current_voter = -1, selected_candidate = -1;
-time_t last_action_time = 0;
+// === User state tracking ===
+bool hasVoted = false;
+int selectedCandidate = -1;
 
-// Function Prototypes
-void load_candidates();
-void save_votes();
-void display_candidates();
-int authenticate_voter();
-void voting_session();
-void confirm_vote();
-void record_vote();
-void display_results();
-void reset_session();
-void feedback(const char* message);
-void timeout_check();
-void log_vote_time(int voter_index);
-int find_voter(const char *id);
+// === Timeout setup ===
+unsigned long lastActivity = 0;
+const unsigned long TIMEOUT = 30000; // 30 seconds
 
-int main() {
-    load_candidates();
-    printf("Welcome to Virtual EVM Simulator\n");
-    while (1) {
-        timeout_check();
-        switch (current_state) {
-            case STATE_IDLE:
-                printf("\n--- EVM Idle ---\n");
-                printf("1. Start Voting\n2. Display Results\n3. Reset Session\n4. Exit\nEnter choice: ");
-                int choice;
-                scanf("%d", &choice);
-                switch (choice) {
-                    case 1:
-                        current_voter = authenticate_voter();
-                        if (current_voter != -1) {
-                            current_state = STATE_VOTING;
-                            last_action_time = time(NULL);
-                        }
-                        break;
-                    case 2:
-                        current_state = STATE_RESULT_DISPLAY;
-                        break;
-                    case 3:
-                        reset_session();
-                        break;
-                    case 4:
-                        save_votes();
-                        exit(0);
-                    default:
-                        feedback("Invalid choice.");
-                }
-                break;
-            case STATE_VOTING:
-                voting_session();
-                break;
-            case STATE_CONFIRMATION:
-                confirm_vote();
-                break;
-            case STATE_VOTE_RECORDED:
-                record_vote();
-                current_state = STATE_IDLE;
-                break;
-            case STATE_RESULT_DISPLAY:
-                display_results();
-                current_state = STATE_IDLE;
-                break;
-            case STATE_LOCKED:
-                feedback("EVM is locked. Please reset session.");
-                current_state = STATE_IDLE;
-                break;
-        }
+void setup() {
+  Serial.begin(9600);
+
+  // Button input setup
+  pinMode(candidate1Btn, INPUT);
+  pinMode(candidate2Btn, INPUT);
+  pinMode(candidate3Btn, INPUT);
+  pinMode(notaBtn, INPUT);
+  pinMode(confirmBtn, INPUT);
+  pinMode(resetBtn, INPUT);
+
+  // Output setup
+  pinMode(greenLED, OUTPUT);
+  pinMode(redLED, OUTPUT);
+  pinMode(buzzerPin, OUTPUT);
+
+  Serial.println("EVM Initialized. Ready to vote.");
+}
+
+bool waitForButtonPress(int pin) {
+  if (digitalRead(pin) == HIGH) {
+    delay(50); // debounce
+    while (digitalRead(pin) == HIGH);
+    delay(50);
+    return true;
+  }
+  return false;
+}
+
+void loop() {
+  // Inactivity timeout check
+  if (millis() - lastActivity > TIMEOUT && currentState != STATE_IDLE) {
+    Serial.println("Timeout: Returning to IDLE...");
+    digitalWrite(redLED, HIGH);
+    tone(buzzerPin, 400);
+    delay(300);
+    noTone(buzzerPin);
+    currentState = STATE_IDLE;
+    selectedCandidate = -1;
+    lastActivity = millis();
+    return;
+  }
+
+  switch (currentState) {
+    case STATE_IDLE:            handleIdle(); break;
+    case STATE_VOTING:          handleVoting(); break;
+    case STATE_CONFIRMATION:   handleConfirmation(); break;
+    case STATE_VOTE_RECORDED:  handleVoteRecorded(); break;
+    case STATE_RESULT_DISPLAY: handleResultDisplay(); break;
+    case STATE_LOCKED:         handleLocked(); break;
+  }
+
+  delay(50); // small delay for stability
+}
+
+// === STATE HANDLERS ===
+
+void handleIdle() {
+  digitalWrite(redLED, LOW);
+  if (hasVoted) {
+    Serial.println("Vote already cast. System locked.");
+
+    // RED LED blinking for longer (3 seconds)
+    for (int i = 0; i < 6; i++) {
+      digitalWrite(redLED, HIGH);
+      delay(250);
+      digitalWrite(redLED, LOW);
+      delay(250);
     }
-    return 0;
+
+    tone(buzzerPin, 500);
+    delay(300);
+    noTone(buzzerPin);
+
+    currentState = STATE_LOCKED;
+    return;
+  }
+
+  Serial.println("Press any candidate button to start voting...");
+
+  if (waitForButtonPress(candidate1Btn) || waitForButtonPress(candidate2Btn) ||
+      waitForButtonPress(candidate3Btn) || waitForButtonPress(notaBtn)) {
+    Serial.println("Voting started.");
+    tone(buzzerPin, 800);
+    delay(100);
+    noTone(buzzerPin);
+    currentState = STATE_VOTING;
+    lastActivity = millis();
+  }
 }
 
-// Load candidate data (hardcoded for demo)
-void load_candidates() {
-    num_candidates = 4; // 4 candidates + NOTA
-    strcpy(candidates[0].name, "Candidate A");
-    strcpy(candidates[1].name, "Candidate B");
-    strcpy(candidates[2].name, "Candidate C");
-    strcpy(candidates[3].name, "Candidate D");
-    strcpy(candidates[4].name, "None of the Above (NOTA)");
-    for (int i = 0; i <= num_candidates; i++) candidates[i].votes = 0;
+void handleVoting() {
+  Serial.println("Select a candidate (1–3) or NOTA...");
+
+  if (waitForButtonPress(candidate1Btn)) selectedCandidate = 0;
+  else if (waitForButtonPress(candidate2Btn)) selectedCandidate = 1;
+  else if (waitForButtonPress(candidate3Btn)) selectedCandidate = 2;
+  else if (waitForButtonPress(notaBtn))     selectedCandidate = 3;
+
+  if (selectedCandidate != -1) {
+    Serial.print("Selected: ");
+    Serial.println(selectedCandidate == 3 ? "NOTA" : "Candidate " + String(selectedCandidate + 1));
+    tone(buzzerPin, 1000);
+    delay(100);
+    noTone(buzzerPin);
+    currentState = STATE_CONFIRMATION;
+    lastActivity = millis();
+  }
 }
 
-// Save votes (simulate secure storage)
-void save_votes() {
-    FILE *f = fopen("votes.dat", "w");
-    for (int i = 0; i <= num_candidates; i++)
-        fprintf(f, "%s,%d\n", candidates[i].name, candidates[i].votes);
-    fclose(f);
+void handleConfirmation() {
+  Serial.println("Press CONFIRM to record your vote.");
+
+  if (waitForButtonPress(confirmBtn)) {
+    votes[selectedCandidate]++;
+    hasVoted = true;
+
+    digitalWrite(greenLED, HIGH);
+    tone(buzzerPin, 1500);
+    delay(200);
+    noTone(buzzerPin);
+    Serial.println("Vote recorded successfully.");
+    delay(1000);
+    digitalWrite(greenLED, LOW);
+
+    currentState = STATE_VOTE_RECORDED;
+    lastActivity = millis();
+  }
 }
 
-// Display candidates
-void display_candidates() {
-    printf("\n--- Candidates ---\n");
-    for (int i = 0; i <= num_candidates; i++)
-        printf("%d. %s\n", i + 1, candidates[i].name);
+void handleVoteRecorded() {
+  Serial.println("Thank you! Returning to IDLE...");
+  selectedCandidate = -1;
+  currentState = STATE_IDLE;
 }
 
-// Find voter index by ID
-int find_voter(const char *id) {
-    for (int i = 0; i < num_voters; i++) {
-        if (strcmp(voters[i].voter_id, id) == 0)
-            return i;
+void handleResultDisplay() {
+  Serial.println("=== Voting Results ===");
+  for (int i = 0; i < 4; i++) {
+    if (i == 3) Serial.print("NOTA: ");
+    else Serial.print("Candidate ");
+    if (i != 3) Serial.print(i + 1);
+    Serial.print(" - Votes: ");
+    Serial.println(votes[i]);
+  }
+
+  // Determine winner
+  int maxVotes = 0;
+  int winner = -1;
+  bool tie = false;
+
+  for (int i = 0; i < 4; i++) {
+    if (votes[i] > maxVotes) {
+      maxVotes = votes[i];
+      winner = i;
+      tie = false;
+    } else if (votes[i] == maxVotes && maxVotes > 0) {
+      tie = true;
     }
-    return -1;
+  }
+
+  if (tie) Serial.println("Result: It's a tie.");
+  else if (winner == 3) Serial.println("Winner: NOTA");
+  else Serial.println("Winner: Candidate " + String(winner + 1));
+
+  currentState = STATE_IDLE;
 }
 
-// Authenticate voter (accept any unique ID)
-int authenticate_voter() {
-    char id[MAX_ID_LEN];
-    printf("Enter Voter ID: ");
-    scanf("%s", id);
+void handleLocked() {
+  Serial.println("System locked. Press RESET to clear votes.");
+  tone(buzzerPin, 400);
+  delay(200);
+  noTone(buzzerPin);
+  delay(200);
 
-    int idx = find_voter(id);
-    if (idx != -1) {
-        if (voters[idx].has_voted) {
-            feedback("You have already voted.");
-            return -1;
-        }
-        feedback("Welcome back! You may vote.");
-        last_action_time = time(NULL);
-        return idx;
-    } else {
-        if (num_voters < MAX_VOTERS) {
-            strcpy(voters[num_voters].voter_id, id);
-            voters[num_voters].has_voted = 0;
-            voters[num_voters].vote_time = 0;
-            feedback("New voter registered. You may vote.");
-            last_action_time = time(NULL);
-            return num_voters++;
-        } else {
-            feedback("Voter limit reached.");
-            return -1;
-        }
-    }
-}
+  if (waitForButtonPress(resetBtn)) {
+    for (int i = 0; i < 4; i++) votes[i] = 0;
+    hasVoted = false;
+    selectedCandidate = -1;
+    Serial.println("System reset. Returning to IDLE.");
 
-// Voting session
-void voting_session() {
-    display_candidates();
-    printf("Select candidate (1-%d): ", num_candidates + 1);
-    scanf("%d", &selected_candidate);
-    if (selected_candidate < 1 || selected_candidate > num_candidates + 1) {
-        feedback("Invalid selection.");
-        return;
-    }
-    selected_candidate--; // zero-based index
-    current_state = STATE_CONFIRMATION;
-    last_action_time = time(NULL);
-}
+    // Double beep for reset success
+    tone(buzzerPin, 1000);
+    delay(100);
+    noTone(buzzerPin);
 
-// Confirm vote
-void confirm_vote() {
-    printf("You selected: %s\n", candidates[selected_candidate].name);
-    printf("1. Confirm\n2. Change Selection\n3. Cancel\nEnter choice: ");
-    int choice;
-    scanf("%d", &choice);
-    switch (choice) {
-        case 1:
-            current_state = STATE_VOTE_RECORDED;
-            break;
-        case 2:
-            current_state = STATE_VOTING;
-            break;
-        case 3:
-            current_state = STATE_IDLE;
-            break;
-        default:
-            feedback("Invalid choice.");
-    }
-    last_action_time = time(NULL);
-}
+    tone(buzzerPin, 1500);
+    delay(100);
+    noTone(buzzerPin);
 
-// Record vote
-void record_vote() {
-    candidates[selected_candidate].votes++;
-    voters[current_voter].has_voted = 1;
-    log_vote_time(current_voter);
-    feedback("Vote recorded successfully!");
-    last_action_time = time(NULL);
-}
-
-// Display results
-void display_results() {
-    printf("\n--- Voting Results ---\n");
-    int max_votes = 0, winner = -1, tie = 0;
-    for (int i = 0; i <= num_candidates; i++) {
-        printf("%s: %d votes\n", candidates[i].name, candidates[i].votes);
-        if (candidates[i].votes > max_votes) {
-            max_votes = candidates[i].votes;
-            winner = i;
-            tie = 0;
-        } else if (candidates[i].votes == max_votes && max_votes != 0) {
-            tie = 1;
-        }
-    }
-    if (max_votes == 0) {
-        printf("No votes cast yet.\n");
-    } else if (tie) {
-        printf("Result: Tie detected.\n");
-    } else {
-        printf("Winner: %s\n", candidates[winner].name);
-    }
-}
-
-// Reset session and clear votes
-void reset_session() {
-    for (int i = 0; i <= num_candidates; i++) candidates[i].votes = 0;
-    num_voters = 0; // Clear all registered voters
-    feedback("Session reset. All votes and voter data cleared.");
-}
-
-// Feedback (simulate LED/sound)
-void feedback(const char* message) {
-    printf("[Feedback]: %s\n", message);
-}
-
-// Timeout check
-void timeout_check() {
-    if (current_state != STATE_IDLE && difftime(time(NULL), last_action_time) > TIMEOUT_SECONDS) {
-        feedback("Session timed out. Returning to Idle state.");
-        current_state = STATE_IDLE;
-    }
-}
-
-// Log voting timestamp
-void log_vote_time(int voter_index) {
-    voters[voter_index].vote_time = time(NULL);
-    char* timestamp = ctime(&voters[voter_index].vote_time);
-    timestamp[strlen(timestamp)-1] = '\0'; // Remove newline
-    printf("Vote timestamp: %s\n", timestamp);
+    currentState = STATE_IDLE;
+  }
 }
